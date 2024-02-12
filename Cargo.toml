@@ -2,8 +2,11 @@
 name = "revproxy"
 version = "0.2.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+license = "MPL-2.0"
+authors = ["chitaotao"]
+description = "Create a reverse proxy from a normal proxy."
+readme = "README.md"
+repository = "https://github.com/chitao1234/"
 
 # TODO: Clean deps
 [dependencies]
