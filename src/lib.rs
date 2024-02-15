@@ -1,11 +1,11 @@
 use std::error::Error;
 
 use anyhow::anyhow;
-use hyper::{body::Body, Request, Response, StatusCode};
+use hyper::{body::Body, Request, Response};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-mod transformer;
+pub mod util;
 
 type StdError = dyn Error + Send + Sync + 'static;
 type BoxError = Box<StdError>;
@@ -81,17 +81,10 @@ async fn proxy_request(
     rev_req: RevProxyRequest,
     request: Request<hyper::body::Body>,
 ) -> ResponseResult {
-    let response = transformer::send_hyper_request(rev_req, request).await?;
+    let response = util::send_hyper_request(rev_req, request).await?;
 
     // let resp = client.get(dest).send().await?;
 
-    transformer::transform_reqwest_response(response).await
+    util::transform_reqwest_response(response).await
 }
 
-// TODO: Add reason
-#[allow(dead_code)]
-fn unprocessable_entity() -> ResponseResult<hyper::http::Error> {
-    Response::builder()
-        .status(StatusCode::UNPROCESSABLE_ENTITY)
-        .body(Body::empty())
-}

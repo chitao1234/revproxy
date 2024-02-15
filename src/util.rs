@@ -1,5 +1,8 @@
+use std::{convert::Infallible, fmt::Display};
+
 use anyhow::anyhow;
-use http::{header::HOST, Request, Response};
+use futures_util::{Future, FutureExt};
+use http::{header::HOST, Request, Response, StatusCode};
 use hyper::Body;
 use reqwest::Response as ReqwestResponse;
 use tracing::info;
@@ -41,4 +44,18 @@ pub(super) async fn transform_reqwest_response(response: ReqwestResponse) -> Res
     let new_resp = new_response.body(Body::wrap_stream(response.bytes_stream()))?;
 
     Ok(new_resp)
+}
+
+pub fn rust_error_to_page<E: Display>(
+    result: impl Future<Output = Result<Response<Body>, E>>,
+) -> impl Future<Output = Result<Response<Body>, Infallible>> {
+    result.map(|result| result.or_else(move |err| Ok(unprocessable_entity(err))))
+}
+
+// TODO: Better page
+fn unprocessable_entity<E: Display>(err: E) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::UNPROCESSABLE_ENTITY)
+        .body(err.to_string().into())
+        .unwrap()
 }
