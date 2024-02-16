@@ -1,9 +1,11 @@
 use std::error::Error;
 
 use anyhow::anyhow;
+use http::header::HOST;
 use hyper::{body::Body, Request, Response};
+use reqwest::{IntoUrl, Proxy};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{debug, info};
 
 pub mod util;
 
@@ -59,32 +61,104 @@ mod tests {
     }
 }
 
-pub async fn revproxy(request: Request<hyper::body::Body>) -> ResponseResult<BoxError> {
-    let rev_req = parse_query(request.uri().query())?;
-    info!("Parsed request {:?}", rev_req);
-    proxy_request(rev_req, request).await
+pub struct RevProxy {
+    client: reqwest::Client,
 }
 
-// TODO: Custom error type
-fn parse_query(query: Option<&str>) -> Result<RevProxyRequest, BoxError> {
-    let req = match query {
-        Some(query) => {
-            info!("Found query: {}", query);
-            serde_qs::from_str(query)?
+impl RevProxy {
+    pub fn builder<U: IntoUrl>() -> RevProxyBuilder<U> {
+        RevProxyBuilder::default()
+    }
+
+    pub async fn revproxy(&self, request: Request<hyper::body::Body>) -> ResponseResult<BoxError> {
+        let rev_req = self.parse_query(request.uri().query())?;
+        info!("Parsed request {:?}", rev_req);
+        self.proxy_request(rev_req, request).await
+    }
+
+    // TODO: Custom error type
+    fn parse_query(&self, query: Option<&str>) -> Result<RevProxyRequest, BoxError> {
+        let req = match query {
+            Some(query) => {
+                info!("Found query: {}", query);
+                serde_qs::from_str(query)?
+            }
+            None => return Err(anyhow!("Query not set.").into()),
+        };
+        Ok(req)
+    }
+
+    async fn proxy_request(
+        &self,
+        rev_req: RevProxyRequest,
+        request: Request<hyper::body::Body>,
+    ) -> ResponseResult {
+        let response = self.send_hyper_request(rev_req, request).await?;
+        util::transform_reqwest_response(response)
+    }
+
+    async fn send_hyper_request(
+        &self,
+        rev_req: RevProxyRequest,
+        request: Request<hyper::body::Body>,
+    ) -> Result<reqwest::Response, BoxError> {
+        let (parts, body) = request.into_parts();
+    
+        let mut headers = parts.headers;
+        headers.remove(HOST);
+    
+        let response = self.client
+            .request(parts.method, rev_req.dest)
+            .version(parts.version)
+            .headers(headers)
+            .body(body)
+            .send()
+            .await?;
+    
+        debug!("Response: {:?}", response);
+    
+        Ok(response)
+    }
+}
+
+impl From<reqwest::Client> for RevProxy {
+    fn from(value: reqwest::Client) -> Self {
+        Self { client: value }
+    }
+}
+
+pub struct RevProxyBuilder<U>
+where
+    U: IntoUrl,
+{
+    proxy: Option<U>,
+}
+
+impl<U> RevProxyBuilder<U>
+where
+    U: IntoUrl,
+{
+    pub fn proxy(mut self, proxy: U) -> Self {
+        self.proxy = Some(proxy);
+        self
+    }
+
+    pub fn build(self) -> Result<RevProxy, BoxError> {
+        let mut client_builder = reqwest::Client::builder();
+        if let Some(proxy) = self.proxy {
+            client_builder = client_builder.proxy(Proxy::all(proxy)?);
         }
-        None => return Err(anyhow!("Query not set.").into()),
-    };
-    Ok(req)
+        Ok(RevProxy {
+            client: client_builder.build()?,
+        })
+    }
 }
 
-async fn proxy_request(
-    rev_req: RevProxyRequest,
-    request: Request<hyper::body::Body>,
-) -> ResponseResult {
-    let response = util::send_hyper_request(rev_req, request).await?;
-
-    // let resp = client.get(dest).send().await?;
-
-    util::transform_reqwest_response(response).await
+impl<U> Default for RevProxyBuilder<U>
+where
+    U: IntoUrl,
+{
+    fn default() -> Self {
+        Self { proxy: None }
+    }
 }
-
