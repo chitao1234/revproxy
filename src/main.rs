@@ -37,8 +37,8 @@ async fn main() -> Result<Infallible, anyhow::Error> {
     debug!("args: {:?}", args);
 
     println!(
-        "Listening for connections on {}, port {}, with proxy {:?}",
-        args.address, args.port, args.proxy
+        "Listening for connections on {}, port {}, with proxy {}",
+        args.address, args.port, args.proxy.as_deref().unwrap_or("from environment")
     );
 
     let mut revbuilder = RevProxy::builder();

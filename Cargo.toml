@@ -24,3 +24,7 @@ tracing = "0.1.40"
 serde = { version = "1.0.196", features = ["derive"] }
 clap = { version = "4.5.0", features = ["derive"] }
 clap_derive = "4.5.0"
+
+[features]
+default = ["socks5"]
+socks5 = ["reqwest/socks"]
