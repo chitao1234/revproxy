@@ -2,14 +2,13 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::{convert::Infallible, net::IpAddr};
 
-use anyhow::anyhow;
 use clap::Parser;
 use hyper::service::service_fn;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
 
 use revproxy::util;
-use revproxy::RevProxy;
+use revproxy::RevProxyClient;
 
 /// Run reverse proxy from normal proxy
 #[derive(Parser, Debug)]
@@ -28,6 +27,8 @@ struct Cli {
     port: u16,
 }
 
+
+
 // TODO: Proper use of span in tracing
 #[tokio::main]
 async fn main() -> Result<Infallible, anyhow::Error> {
@@ -36,42 +37,46 @@ async fn main() -> Result<Infallible, anyhow::Error> {
     let args = Cli::parse();
     debug!("args: {:?}", args);
 
+    let socket_addr = SocketAddr::new(args.address, args.port);
+
     println!(
-        "Listening for connections on {}, port {}, with proxy {}",
-        args.address, args.port, args.proxy.as_deref().unwrap_or("from environment")
+        "Listening for connections on http://{}, with proxy {}",
+        socket_addr, args.proxy.as_deref().unwrap_or("from environment")
     );
 
-    let mut revbuilder = RevProxy::builder();
+    let mut reqwest_client = reqwest::Client::builder();
     if let Some(proxy) = args.proxy {
-        revbuilder = revbuilder.proxy(proxy);
+        reqwest_client = reqwest_client.proxy(reqwest::Proxy::all(proxy)?);
     }
-    let revclient = revbuilder.build().map_err(|e| anyhow!(e))?;
-    let revclient = Arc::new(revclient);
+    let reqwest_client = reqwest_client.build()?;
+    let revclient = Arc::new(RevProxyClient::from(reqwest_client));
 
-    let listener = TcpListener::bind(SocketAddr::new(args.address, args.port)).await?;
+    let listener = TcpListener::bind(socket_addr).await?;
 
-    // let revclient = revclient.clone();
+    let revclient = revclient.clone();
     let service = move |req| {
         let revclient = revclient.clone();
 
         async move {
             let resp = revclient.revproxy(req).await;
             Ok::<_, Infallible>(util::rust_error_to_page(resp))
+            // Ok::<_, Infallible>(Response::new(Full::new(Bytes::from("Hello, World!"))))
         }
+
     };
     let service = service_fn(service);
 
     loop {
-        let (stream, _) = listener.accept().await?;
-        info!("Received connection.");
+        let (stream, addr) = listener.accept().await?;
+        info!("Received connection from {}", addr);
 
 
         let service = service.clone();
         tokio::spawn(async move {
-            if let Err(err) = hyper::server::conn::Http::new()
-                .http1_keep_alive(true)
+            if let Err(err) = hyper::server::conn::http1::Builder::new()
+                .keep_alive(true)
                 .serve_connection(
-                    stream,
+                    hyper_util::rt::TokioIo::new(stream),
                     service,
                 )
                 .await
