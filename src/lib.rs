@@ -1,17 +1,25 @@
-use std::error::Error;
+use core::fmt;
+use std::ops::DerefMut;
+use std::{error::Error, ops::Deref};
 
+use crate::rewrite::RewriteRules;
 use anyhow::anyhow;
-use futures_util::{Stream, StreamExt};
-use http::header::HOST;
-use http_body_util::{BodyStream, StreamBody};
+use encoding_rs::Encoding;
+use fancy_regex::Regex;
+use futures_util::StreamExt;
+use http::{header::HOST, Uri};
+use http_body_util::{BodyStream, Full};
 use hyper::{
-    body::{Body, Bytes, Frame},
+    body::{Body, Bytes},
     Request, Response,
 };
-use reqwest::Error as ReqwestError;
+use mime::Mime;
+use reqwest::Response as ReqwestResponse;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
+pub mod rewrite;
+pub mod server;
 pub mod util;
 
 type StdError = dyn Error + Send + Sync + 'static;
@@ -19,83 +27,60 @@ type BoxError = Box<StdError>;
 type ResponseResult<B, E2 = BoxError> = Result<Response<B>, E2>;
 
 #[derive(Serialize, Deserialize, Debug, Default, PartialEq, Clone)]
-struct RevProxyRequest {
-    dest: String,
-    #[serde(rename = "default")]
+pub struct RevProxyRequest {
+    #[serde(rename = "default", default)]
+    no_remove_host: bool,
     #[serde(default)]
-    without_default_header_strategy: bool,
-    #[serde(default)]
-    keep: Vec<String>,
+    append: Vec<(String, String)>,
     #[serde(default)]
     drop: Vec<String>,
+    #[serde(default = "_default_true")]
+    host_rewrite: bool,
+    custom_rewrite: Option<Vec<RewriteRules>>,
+    #[serde(skip)]
+    local_addr: String,
+    dest: UriWrapper,
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use crate::RevProxyRequest;
+const fn _default_true() -> bool {
+    true
+}
 
-//     #[test]
-//     fn serde() {
-//         let req_default = RevProxyRequest {
-//             dest: "http://localhost:8001/?dest=https%3A%2F%2Fexample.com".to_owned(),
-//             ..Default::default()
-//         };
-//         let req_default_str1 =
-//             "dest=http%3A%2F%2Flocalhost%3A8001%2F%3Fdest%3Dhttps%253A%252F%252Fexample.com&default=false";
-//         assert_eq!(serde_qs::to_string(&req_default).unwrap(), req_default_str1);
-//         let req_default_str2 =
-//             "dest=http%3A%2F%2Flocalhost%3A8001%2F%3Fdest%3Dhttps%253A%252F%252Fexample.com";
-//         assert_eq!(
-//             serde_qs::from_str::<RevProxyRequest>(req_default_str2).unwrap(),
-//             req_default
-//         );
-
-//         let req = RevProxyRequest {
-//             dest: "https://example.com".to_owned(),
-//             without_default_header_strategy: false,
-//             keep: vec!["cookie".to_owned(), "USER-AGENT".to_owned()],
-//             drop: vec!["accept".to_owned(), "Accept-Language".to_owned()],
-//         };
-//         let req_str1 = "dest=https%3A%2F%2Fexample.com&default=false&keep[0]=cookie&keep[1]=USER-AGENT&drop[0]=accept&drop[1]=Accept-Language";
-//         assert_eq!(serde_qs::to_string(&req).unwrap(), req_str1);
-//         let req_str2 = "dest=https%3A%2F%2Fexample.com&keep[]=cookie&default=false&keep[]=USER-AGENT&drop[999]=Accept-Language&drop[1]=accept";
-//         assert_eq!(
-//             serde_qs::from_str::<RevProxyRequest>(&req_str2).unwrap(),
-//             req
-//         );
-//     }
-// }
-
+// reqwest::Client is clone so no need to wrap it in Arc
+#[derive(Debug, Clone)]
 pub struct RevProxyClient {
     client: reqwest::Client,
 }
 
 impl RevProxyClient {
-    // pub fn builder<U: IntoUrl>() -> RevProxyBuilder<U> {
-    //     RevProxyBuilder::default()
-    // }
-
     pub async fn revproxy<B>(
         &self,
+        rev_req: RevProxyRequest,
         request: Request<B>,
-    ) -> ResponseResult<StreamBody<impl Stream<Item = Result<Frame<Bytes>, ReqwestError>>>>
+    ) -> ResponseResult<Full<Bytes>>
     where
         B: Body + Send + Sync + 'static,
         <B as Body>::Error: std::error::Error + Send + Sync,
         Bytes: From<<B as Body>::Data>,
         <B as Body>::Data: std::fmt::Debug + Send + Sync,
     {
-        let rev_req = self.parse_query(request.uri().query())?;
-        info!("Parsed request {:?}", rev_req);
-
         let (parts, body) = request.into_parts();
 
         let mut headers = parts.headers;
-        headers.remove(HOST);
+        if !rev_req.no_remove_host {
+            headers.remove(HOST);
+        }
+        for key in &rev_req.drop {
+            headers.remove(key);
+        }
+        for (key, value) in &rev_req.append {
+            headers.append(http::HeaderName::try_from(key)?, value.try_into()?);
+        }
 
+        // TODO: http version?
         let response = self
             .client
-            .request(parts.method, rev_req.dest)
+            .request(parts.method, rev_req.dest.to_string())
             .headers(headers)
             .body(reqwest::Body::wrap_stream(
                 BodyStream::new(body).map(|result| result.map(|frame| frame.into_data().unwrap())),
@@ -103,27 +88,171 @@ impl RevProxyClient {
             .send()
             .await?;
 
-        debug!("Response: {:?}", response);
+        trace!("Response: {:?}", response);
 
-        util::transform_reqwest_response(response)
+        Self::transform_reqwest_response(&rev_req, response).await
     }
 
-    // TODO: Custom error type
-    fn parse_query(&self, query: Option<&str>) -> Result<RevProxyRequest, BoxError> {
-        let req = match query {
-            Some(query) => {
-                info!("Found query: {}", query);
-                serde_qs::from_str(query)?
+    // remove :80 and :443 from authority
+    fn sanitize_authority(uri: &Uri) -> Result<String, BoxError> {
+        debug!("{:?}", uri);
+        Ok(uri
+            .authority()
+            .map(|authority| {
+                let mut auth = authority.as_str().to_owned();
+                if auth.ends_with(":443") || auth.ends_with(":80") {
+                    auth = auth.replace(":443", "").replace(":80", "");
+                }
+                auth
+            })
+            .ok_or(anyhow!("Uri does not contain authority."))?)
+    }
+
+    // TODO: Error handling
+    async fn transform_reqwest_response(
+        rev_req: &RevProxyRequest,
+        response: ReqwestResponse,
+    ) -> ResponseResult<Full<Bytes>> {
+        let mut new_response = Response::builder()
+            .version(response.version())
+            .status(response.status());
+
+        *new_response
+            .headers_mut()
+            .ok_or(anyhow!("Failed building response!"))? = response.headers().clone();
+
+        let host = Self::sanitize_authority(&response.url().to_string().parse()?)?;
+        info!(host);
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<Mime>().ok());
+        let encoding_name = content_type
+            .as_ref()
+            .and_then(|mime| {
+                mime.get_param(mime::CHARSET)
+                    .map(|charset| charset.as_str())
+            })
+            .unwrap_or("utf-8");
+        let encoding = Encoding::for_label(encoding_name.as_bytes())
+            .ok_or(anyhow!("Unable to get encoding: {}", encoding_name))?;
+
+        let body = response.bytes().await?;
+        let (text, _, decode_error) = encoding.decode(&body);
+
+        let mut text = text.into_owned();
+        trace!("Response after decode: {}", text);
+
+        let s = if decode_error {
+            // XXX: if error, assumes binary, do nothing
+            info!("Decode error, not replacing.");
+            body
+        } else {
+            if rev_req.host_rewrite {
+                let new_req = RevProxyRequest {
+                    // dest: host,
+                    ..rev_req.clone()
+                };
+                let query = serde_qs::to_string(&new_req)?;
+                let replace = Uri::builder()
+                    .authority(rev_req.local_addr.as_str())
+                    .path_and_query("/?".to_owned() + &query)
+                    .scheme("PLACEHOLDER")
+                    .build()?
+                    .to_string();
+                let replace = replace.replace("PLACEHOLDER://", ""); // FIXME: dirty hack
+                debug!("Replaceing {} with {}", new_req.dest, replace);
+                text = text.replace(&new_req.dest.to_string(), &replace);
             }
-            None => return Err(anyhow!("Query not set.").into()),
+
+            if let Some(rules) = rev_req.custom_rewrite.as_ref() {
+                for rule in rules {
+                    // FIXME: Why clone?????
+                    let regex: Regex = rule.find.clone().into();
+                    text = regex.replace_all(&text, &rule.replace).into_owned();
+                }
+            }
+            text.into()
         };
-        Ok(req)
+
+        let new_resp = new_response.body(Full::new(s))?;
+        Ok(new_resp)
     }
 }
 
 impl From<reqwest::Client> for RevProxyClient {
     fn from(value: reqwest::Client) -> Self {
         Self { client: value }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct UriWrapper {
+    uri: Uri,
+}
+
+impl<'de> Deserialize<'de> for UriWrapper {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let uri = String::deserialize(deserializer)?;
+        Ok(Self {
+            uri: uri.parse().map_err(serde::de::Error::custom)?,
+        })
+    }
+}
+
+impl Serialize for UriWrapper {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.uri.to_string().serialize(serializer)
+    }
+}
+
+impl TryFrom<String> for UriWrapper {
+    type Error = BoxError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Ok(Self {
+            uri: value.parse()?,
+        })
+    }
+}
+
+impl From<Uri> for UriWrapper {
+    fn from(value: Uri) -> Self {
+        Self { uri: value }
+    }
+}
+
+impl From<UriWrapper> for Uri {
+    fn from(value: UriWrapper) -> Self {
+        value.uri
+    }
+}
+
+impl Deref for UriWrapper {
+    type Target = Uri;
+
+    fn deref(&self) -> &Self::Target {
+        &self.uri
+    }
+}
+
+impl DerefMut for UriWrapper {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.uri
+    }
+}
+
+impl fmt::Display for UriWrapper {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.uri)
     }
 }
 
